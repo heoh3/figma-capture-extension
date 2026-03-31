@@ -3,9 +3,12 @@
 // 주의: 이 함수는 .toString()으로 직렬화되어 페이지 컨텍스트에서 실행됨.
 //       외부 변수 참조 불가. 완전히 self-contained 이어야 함.
 async function precaptureInPage(screenshotDataUrl, scrollInfo) {
-  if (window.__figmaPreCaptureApplied) return;
-  window.__figmaPreCaptureApplied = true;
+  // 이전 precapture가 남아있으면 먼저 복원
+  if (typeof window.__figmaRestorePreCapture === 'function') {
+    window.__figmaRestorePreCapture();
+  }
 
+  window.__figmaPreCaptureApplied = true;
   const restoreFns = [];
   const dpr = window.devicePixelRatio || 1;
 
@@ -83,33 +86,87 @@ async function precaptureInPage(screenshotDataUrl, scrollInfo) {
     await replaceWithImg(el, replaceSelectWithDiv);
   }
 
-  // ── 2. CSS pseudo-element 기반 토글/스위치 교체 ──────────────────
-  // ::before 또는 ::after 에 content가 있는 요소만 대상
-  const candidates = document.querySelectorAll([
-    'input[type="checkbox"]',
-    'input[type="radio"]',
-    'label',
-    '[role="switch"]',
-    '[class*="toggle"]',
-    '[class*="switch"]',
-    '[class*="slider"]',
-    '[class*="check"]',
-  ].join(','));
+  // ── 2. 토글/스위치/체크박스/라디오 교체 ──────────────────────────
+  const processed = new WeakSet();
 
-  for (const el of candidates) {
+  // input[type="checkbox/radio"]의 시각적 래퍼를 찾는 헬퍼
+  // (실제 input은 보통 숨겨져 있고, 시각적 토글은 label이나 부모 요소에 있음)
+  function findVisualTarget(input) {
+    const rect = input.getBoundingClientRect();
+    // input 자체가 충분히 크면 그대로 사용
+    if (rect.width >= 12 && rect.height >= 12) return input;
+
+    // for 속성으로 연결된 label
+    if (input.id) {
+      try {
+        const label = document.querySelector(`label[for="${CSS.escape(input.id)}"]`);
+        if (label) {
+          const lr = label.getBoundingClientRect();
+          if (lr.width >= 12 && lr.height >= 12) return label;
+        }
+      } catch {}
+    }
+
+    // 부모 label
+    const parentLabel = input.closest('label');
+    if (parentLabel) {
+      const lr = parentLabel.getBoundingClientRect();
+      if (lr.width >= 12 && lr.height >= 12) return parentLabel;
+    }
+
+    // 부모 3단계까지 탐색 (토글 래퍼 찾기)
+    let parent = input.parentElement;
+    for (let i = 0; i < 3 && parent; i++) {
+      const pr = parent.getBoundingClientRect();
+      if (pr.width >= 12 && pr.height >= 12 && pr.width <= 200 && pr.height <= 100) {
+        return parent;
+      }
+      parent = parent.parentElement;
+    }
+    return null;
+  }
+
+  // 2a. checkbox/radio — 항상 교체 (시각적 래퍼 자동 탐색)
+  for (const input of document.querySelectorAll('input[type="checkbox"], input[type="radio"]')) {
+    if (input.closest('#figma-capture-ui')) continue;
+    const target = findVisualTarget(input);
+    if (!target || processed.has(target)) continue;
+    processed.add(target);
+    await replaceWithImg(target, null);
+  }
+
+  // 2b. role="switch", 토글/스위치 클래스 — 크기 필터 후 항상 교체
+  //     (큰 컨테이너가 아닌 작은 UI 컴포넌트만 대상)
+  for (const el of document.querySelectorAll(
+    '[role="switch"], [class*="toggle"], [class*="Toggle"], [class*="switch"], [class*="Switch"], [data-state]'
+  )) {
     if (el.closest('#figma-capture-ui')) continue;
+    if (processed.has(el)) continue;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 1 || rect.height < 1 || rect.width > 200 || rect.height > 100) continue;
+    processed.add(el);
+    await replaceWithImg(el, null);
+  }
+
+  // 2c. label, slider, check — pseudo-element이 있는 경우만 교체
+  for (const el of document.querySelectorAll('label, [class*="slider"], [class*="Slider"]')) {
+    if (el.closest('#figma-capture-ui')) continue;
+    if (processed.has(el)) continue;
 
     const before = getComputedStyle(el, '::before');
     const after  = getComputedStyle(el, '::after');
     const hasMeaningfulPseudo =
       (before.content && before.content !== 'none' && before.content !== 'normal') ||
       (after.content  && after.content  !== 'none' && after.content  !== 'normal');
-
     if (!hasMeaningfulPseudo) continue;
+
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 1 || rect.height < 1 || rect.width > 300 || rect.height > 100) continue;
+    processed.add(el);
     await replaceWithImg(el, null);
   }
 
-  // ── 복원 (스크롤 위치 포함) ─────────────────────────────────────
+  // ── 복원 함수 등록 ─────────────────────────────────────────────
   window.__figmaRestorePreCapture = () => {
     restoreFns.forEach(fn => fn());
     restoreFns.length = 0;
@@ -118,37 +175,79 @@ async function precaptureInPage(screenshotDataUrl, scrollInfo) {
       window.scrollTo({ top: scrollInfo.sy, left: scrollInfo.sx, behavior: 'instant' });
     }
   };
-  setTimeout(window.__figmaRestorePreCapture, 15000);
+  // 안전장치: 60초 후 자동 복원 (수동 복원이 안 된 경우 대비)
+  setTimeout(() => {
+    if (window.__figmaPreCaptureApplied) {
+      window.__figmaRestorePreCapture();
+    }
+  }, 60000);
   console.log('[Figma PreCapture] DOM prepared for capture');
 }
 
-async function inject(tabId) {
-  try {
-    // 1. 캡처 전 준비: 폰트 로드 대기 + 스크롤 위치 저장 후 최상단으로
-    const scrollInfo = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: 'MAIN',
-      func: async () => {
-        // 커스텀 폰트가 완전히 로드될 때까지 대기 (텍스트 크기 오류 방지)
-        await document.fonts.ready;
-        const sx = window.scrollX, sy = window.scrollY;
-        // 최상단으로 스크롤 (뷰포트 경계에 걸친 요소 잘림 방지)
-        window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
-        // 리플로우 반영 대기
-        await new Promise(r => setTimeout(r, 120));
-        return { sx, sy };
-      }
-    }).then(r => r[0]?.result ?? { sx: 0, sy: 0 });
-
-    // 2. 스크롤이 완료된 상태에서 스크린샷
-    let screenshot = null;
-    try {
-      screenshot = await chrome.tabs.captureVisibleTab(null, { format: 'png' });
-    } catch (e) {
-      console.warn('[Figma Capture] Screenshot failed (will use CSS fallback):', e);
+// ── 헬퍼: 페이지 준비 (폰트 로드 + 스크롤 최상단) ───────────────
+async function preparePage(tabId) {
+  return chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    func: async () => {
+      await document.fonts.ready;
+      const sx = window.scrollX, sy = window.scrollY;
+      window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
+      await new Promise(r => setTimeout(r, 120));
+      return { sx, sy };
     }
+  }).then(r => r[0]?.result ?? { sx: 0, sy: 0 });
+}
 
-    // 3. 스크린샷 기반 DOM 전처리 (select/toggle 교체) + 스크롤 복원 예약
+// ── 헬퍼: 스크린샷 촬영 ─────────────────────────────────────────
+async function takeScreenshot() {
+  try {
+    return await chrome.tabs.captureVisibleTab(null, { format: 'png' });
+  } catch (e) {
+    console.warn('[Figma Capture] Screenshot failed (will use CSS fallback):', e);
+    return null;
+  }
+}
+
+// ── 수동 캡처 플로우 (precapture → capture → restore) ────────────
+async function performCapture(tabId) {
+  // 1. 페이지 준비 + 스크린샷
+  const scrollInfo = await preparePage(tabId);
+  const screenshot = await takeScreenshot();
+
+  // 2. DOM 전처리
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    func: precaptureInPage,
+    args: [screenshot, scrollInfo]
+  });
+
+  // 3. captureForDesign 실행 후 DOM 복원
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    func: async () => {
+      try {
+        if (typeof window.figma?.captureForDesign === 'function') {
+          await window.figma.captureForDesign({ selector: 'body' });
+        }
+      } finally {
+        if (typeof window.__figmaRestorePreCapture === 'function') {
+          window.__figmaRestorePreCapture();
+        }
+      }
+    }
+  });
+}
+
+// ── 초기 주입 ────────────────────────────────────────────────────
+async function inject(tabId, autoTrigger = false) {
+  try {
+    // 1. 페이지 준비 + 스크린샷 + DOM 전처리 (capture.js 주입 전에 완료해야 함)
+    const scrollInfo = await preparePage(tabId);
+    const screenshot = await takeScreenshot();
+
     await chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
@@ -156,17 +255,37 @@ async function inject(tabId) {
       args: [screenshot, scrollInfo]
     });
 
-    // 3. Figma 캡처 라이브러리 주입 (로컬 파일 → Chrome이 CSP 우회하여 직접 주입)
+    // 2. Figma 캡처 라이브러리 주입 (CSP 우회를 위해 files 사용)
+    //    autoTrigger: capture.js가 #figmacapture= 감지하여 자동 실행
+    //    manual: 아래에서 직접 captureForDesign 호출
     await chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
       files: ['capture.js']
     });
 
-    // 4. 상태 배지 UI
+    // 3. 수동 트리거 (아이콘 클릭)인 경우 즉시 캡처 실행 후 복원
+    if (!autoTrigger) {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        world: 'MAIN',
+        func: async () => {
+          try {
+            if (typeof window.figma?.captureForDesign === 'function') {
+              await window.figma.captureForDesign({ selector: 'body' });
+            }
+          } finally {
+            if (typeof window.__figmaRestorePreCapture === 'function') {
+              window.__figmaRestorePreCapture();
+            }
+          }
+        }
+      });
+    }
+
+    // 4. 상태 배지 UI (ISOLATED world — chrome.runtime 접근 가능)
     await chrome.scripting.executeScript({
       target: { tabId },
-      world: 'MAIN',
       files: ['capture-ui.js']
     });
 
@@ -176,10 +295,23 @@ async function inject(tabId) {
   }
 }
 
+// ── UI 버튼에서 수동 재캡처 요청 수신 ───────────────────────────
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.action === 'capture' && sender.tab) {
+    performCapture(sender.tab.id)
+      .then(() => sendResponse({ ok: true }))
+      .catch(e => {
+        console.error('[Figma Capture] Manual capture failed:', e);
+        sendResponse({ ok: false });
+      });
+    return true; // async response
+  }
+});
+
 // Manual: click extension icon (모든 http/https 페이지에서 동작)
 chrome.action.onClicked.addListener(async (tab) => {
   if (!tab.url || !tab.url.startsWith('http')) return;
-  await inject(tab.id);
+  await inject(tab.id, false);
 });
 
 // Auto: when Claude Code opens a page with capture params
@@ -188,7 +320,7 @@ chrome.webNavigation.onCompleted.addListener(async (details) => {
   if (!details.url || !details.url.includes('figmacapture=')) return;
 
   await new Promise(r => setTimeout(r, 1000));
-  await inject(details.tabId);
+  await inject(details.tabId, true);
 }, {
   url: [
     { hostEquals: 'localhost' },

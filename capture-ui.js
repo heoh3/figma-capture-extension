@@ -122,19 +122,20 @@
     if (!container.contains(e.target)) panel.classList.remove('open');
   });
 
-  // 직접 캡처 버튼 — window.figma.captureForDesign 는 capture.js가 노출
+  // 직접 캡처 버튼 — background에 메시지 전송하여 전체 플로우 실행
+  // (ISOLATED world에서 실행되므로 chrome.runtime 사용 가능)
   captureBtn.addEventListener('click', () => {
-    if (typeof window.figma?.captureForDesign === 'function') {
-      captureBtn.disabled = true;
-      captureBtn.textContent = '캡처 중...';
-      window.figma.captureForDesign({ selector: 'body' })
-        .finally(() => {
-          captureBtn.disabled = false;
-          captureBtn.textContent = '지금 캡처하기';
-        });
-    } else {
-      captureBtn.textContent = 'Capture API 없음';
-      setTimeout(() => { captureBtn.textContent = '지금 캡처하기'; }, 2000);
-    }
+    captureBtn.disabled = true;
+    captureBtn.textContent = '캡처 중...';
+    chrome.runtime.sendMessage({ action: 'capture' }, (response) => {
+      captureBtn.disabled = false;
+      if (response?.ok) {
+        captureBtn.textContent = '완료!';
+        setTimeout(() => { captureBtn.textContent = '지금 캡처하기'; }, 2000);
+      } else {
+        captureBtn.textContent = '캡처 실패';
+        setTimeout(() => { captureBtn.textContent = '지금 캡처하기'; }, 2000);
+      }
+    });
   });
 })();
