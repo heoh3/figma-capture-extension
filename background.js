@@ -1,12 +1,3 @@
-// capture.js를 서비스 워커에서 fetch해서 캐시 (페이지 CSP 우회)
-let _captureScript = null;
-async function getCaptureScript() {
-  if (_captureScript) return _captureScript;
-  const resp = await fetch('https://mcp.figma.com/mcp/html-to-design/capture.js');
-  if (!resp.ok) throw new Error(`Failed to fetch capture.js: ${resp.status}`);
-  _captureScript = await resp.text();
-  return _captureScript;
-}
 
 // 페이지에서 실행될 precapture 함수 (async, screenshot 기반)
 // 주의: 이 함수는 .toString()으로 직렬화되어 페이지 컨텍스트에서 실행됨.
@@ -165,19 +156,11 @@ async function inject(tabId) {
       args: [screenshot, scrollInfo]
     });
 
-    // 3. Figma 캡처 라이브러리 주입 (서비스 워커에서 fetch → 인라인 주입)
-    const captureCode = await getCaptureScript();
+    // 3. Figma 캡처 라이브러리 주입 (로컬 파일 → Chrome이 CSP 우회하여 직접 주입)
     await chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
-      func: (code) => {
-        if (window.__figmaCaptureScriptLoaded) return;
-        window.__figmaCaptureScriptLoaded = true;
-        const s = document.createElement('script');
-        s.textContent = code;
-        document.head.appendChild(s);
-      },
-      args: [captureCode]
+      files: ['capture.js']
     });
 
     // 4. 상태 배지 UI

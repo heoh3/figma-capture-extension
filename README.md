@@ -14,9 +14,13 @@ A Chrome extension that captures localhost web pages into Figma. Works with **Fi
 ## Installation
 
 1. Clone this repo
-2. Open `chrome://extensions`
-3. Enable **Developer mode** (top right)
-4. Click **Load unpacked** → select this folder
+2. Download the Figma capture library (not included in repo):
+   ```bash
+   bash download-capture.sh
+   ```
+3. Open `chrome://extensions`
+4. Enable **Developer mode** (top right)
+5. Click **Load unpacked** → select this folder
 
 ## Usage
 
