@@ -175,13 +175,9 @@ async function inject(tabId) {
   }
 }
 
-// Manual: click extension icon
+// Manual: click extension icon (모든 http/https 페이지에서 동작)
 chrome.action.onClicked.addListener(async (tab) => {
-  if (!tab.url) return;
-  try {
-    const u = new URL(tab.url);
-    if (!['localhost', '127.0.0.1', '0.0.0.0'].includes(u.hostname)) return;
-  } catch { return; }
+  if (!tab.url || !tab.url.startsWith('http')) return;
   await inject(tab.id);
 });
 
