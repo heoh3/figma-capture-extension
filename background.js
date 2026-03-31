@@ -1,3 +1,13 @@
+// capture.js를 서비스 워커에서 fetch해서 캐시 (CSP 우회용)
+let _captureScript = null;
+async function getCaptureScript() {
+  if (_captureScript) return _captureScript;
+  const resp = await fetch('https://mcp.figma.com/mcp/html-to-design/capture.js');
+  if (!resp.ok) throw new Error(`Failed to fetch capture.js: ${resp.status}`);
+  _captureScript = await resp.text();
+  return _captureScript;
+}
+
 async function inject(tabId) {
   try {
     // 1. DOM 전처리: select/toggle pseudo-element 등 깨지는 요소 보완
@@ -6,21 +16,19 @@ async function inject(tabId) {
       world: 'MAIN',
       files: ['precapture.js']
     });
-    // 2. Figma 캡처 라이브러리 동적 로드 (Figma 서버에서 최신 버전 fetch)
+    // 2. 서비스 워커에서 fetch한 코드를 인라인으로 주입 (페이지 CSP 우회)
+    const captureCode = await getCaptureScript();
     await chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
-      func: () => {
+      func: (code) => {
         if (window.__figmaCaptureScriptLoaded) return;
         window.__figmaCaptureScriptLoaded = true;
-        return new Promise((resolve, reject) => {
-          const s = document.createElement('script');
-          s.src = 'https://mcp.figma.com/mcp/html-to-design/capture.js';
-          s.onload = resolve;
-          s.onerror = () => reject(new Error('Failed to load Figma capture script'));
-          document.head.appendChild(s);
-        });
-      }
+        const s = document.createElement('script');
+        s.textContent = code;
+        document.head.appendChild(s);
+      },
+      args: [captureCode]
     });
     // 3. 상태 배지 UI 표시
     await chrome.scripting.executeScript({
