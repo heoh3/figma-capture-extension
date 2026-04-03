@@ -12,60 +12,54 @@ async function precaptureInPage(screenshotDataUrl, scrollInfo) {
   const restoreFns = [];
   const dpr = window.devicePixelRatio || 1;
 
-  // 스크린샷 이미지를 한 번만 로드해서 캐싱
-  let _screenshotImg = null;
+  // ── 스크린샷 이미지를 한 번만 로드해서 캐싱 ──────────────────────
+  let _ssImg = null;
   function loadScreenshot() {
-    if (_screenshotImg) return Promise.resolve(_screenshotImg);
+    if (_ssImg) return Promise.resolve(_ssImg);
     return new Promise((resolve, reject) => {
       const img = new Image();
-      img.onload = () => { _screenshotImg = img; resolve(img); };
+      img.onload  = () => { _ssImg = img; resolve(img); };
       img.onerror = reject;
       img.src = screenshotDataUrl;
     });
   }
 
-  // 요소 영역을 스크린샷에서 잘라내서 data URL 반환
-  // 물리적 픽셀(DPR) 기준으로 크롭 → Retina에서 선명하게 유지
-  async function cropToDataUrl(el) {
-    if (!screenshotDataUrl) return null;
+  // ── 사전 수집한 rect로 스크린샷 크롭 ──────────────────────────────
+  // ★ rect는 DOM 수정 전에 캡처해야 정확함 (수정 후 레이아웃이 달라짐)
+  async function cropFromRect(rect) {
+    if (!screenshotDataUrl || rect.width < 1 || rect.height < 1) return null;
     try {
-      const rect = el.getBoundingClientRect();
-      if (rect.width < 1 || rect.height < 1) return null;
-
       const img = await loadScreenshot();
-      const ssW = img.naturalWidth;
-      const ssH = img.naturalHeight;
+      const ssW = img.naturalWidth, ssH = img.naturalHeight;
 
-      // 물리적 픽셀 좌표 계산 + 경계 초과 방지
-      const sx = Math.max(0, Math.round(rect.left * dpr));
-      const sy = Math.max(0, Math.round(rect.top * dpr));
-      const sw = Math.min(Math.round(rect.width * dpr), ssW - sx);
+      const sx = Math.max(0, Math.round(rect.left  * dpr));
+      const sy = Math.max(0, Math.round(rect.top   * dpr));
+      const sw = Math.min(Math.round(rect.width  * dpr), ssW - sx);
       const sh = Math.min(Math.round(rect.height * dpr), ssH - sy);
       if (sw < 1 || sh < 1) return null;
 
-      // 물리적 픽셀 크기 캔버스에 크롭 → Retina 선명도 유지
+      // 물리적 픽셀 크기 캔버스 → Retina 선명도 유지
       const canvas = document.createElement('canvas');
-      canvas.width = sw;
+      canvas.width  = sw;
       canvas.height = sh;
       canvas.getContext('2d').drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
-      return canvas.toDataURL();
+      return { dataUrl: canvas.toDataURL(), cssW: rect.width, cssH: rect.height };
     } catch (e) {
-      console.warn('[Figma PreCapture] cropToDataUrl failed:', e);
+      console.warn('[Figma PreCapture] cropFromRect failed:', e);
       return null;
     }
   }
 
-  // 요소를 스크린샷 crop img로 교체 (실패하면 fallback)
-  async function replaceWithImg(el, fallbackFn) {
-    const imgSrc = await cropToDataUrl(el);
-    if (!imgSrc) { fallbackFn && fallbackFn(el); return; }
+  // ── DOM 수정: 요소를 크롭 이미지로 교체 ─────────────────────────
+  async function replaceWithCrop(el, preRect, fallbackFn) {
+    const crop = await cropFromRect(preRect);
+    if (!crop) { fallbackFn && fallbackFn(el); return; }
 
-    const rect = el.getBoundingClientRect();
     const img = document.createElement('img');
-    img.src = imgSrc;
+    img.src = crop.dataUrl;
     img.style.cssText = [
-      `width:${rect.width}px`,
-      `height:${rect.height}px`,
+      `width:${crop.cssW}px`,
+      `height:${crop.cssH}px`,
       `display:inline-block`,
       `vertical-align:middle`,
       `border-radius:${getComputedStyle(el).borderRadius}`,
@@ -77,7 +71,7 @@ async function precaptureInPage(screenshotDataUrl, scrollInfo) {
     restoreFns.push(() => { img.remove(); el.style.display = origDisplay; });
   }
 
-  // fallback: <select> → 스타일 복사한 <div>
+  // ── fallback: <select> → CSS div ──────────────────────────────────
   function replaceSelectWithDiv(select) {
     const cs = getComputedStyle(select);
     const div = document.createElement('div');
@@ -97,152 +91,102 @@ async function precaptureInPage(screenshotDataUrl, scrollInfo) {
     restoreFns.push(() => { div.remove(); select.style.display = origDisplay; });
   }
 
-  // ── 1. <select> 교체 ─────────────────────────────────────────────
-  for (const el of document.querySelectorAll('select')) {
-    if (el.closest('#figma-capture-ui')) continue;
-    await replaceWithImg(el, replaceSelectWithDiv);
-  }
-
-  // ── 2. 토글/스위치/체크박스/라디오 교체 ──────────────────────────
-  const processed = new WeakSet();
-
-  // input[type="checkbox/radio"]의 시각적 래퍼를 찾는 헬퍼
-  // (실제 input은 보통 숨겨져 있고, 시각적 토글은 label이나 부모 요소에 있음)
+  // ── hidden input의 시각적 래퍼 탐색 ─────────────────────────────
   function findVisualTarget(input) {
     const rect = input.getBoundingClientRect();
-    // input 자체가 충분히 크면 그대로 사용
-    if (rect.width >= 12 && rect.height >= 12) return input;
+    if (rect.width >= 12 && rect.height >= 12) return { el: input, rect };
 
-    // for 속성으로 연결된 label
     if (input.id) {
       try {
         const label = document.querySelector(`label[for="${CSS.escape(input.id)}"]`);
         if (label) {
           const lr = label.getBoundingClientRect();
-          if (lr.width >= 12 && lr.height >= 12) return label;
+          if (lr.width >= 12 && lr.height >= 12) return { el: label, rect: lr };
         }
       } catch {}
     }
 
-    // 부모 label
     const parentLabel = input.closest('label');
     if (parentLabel) {
       const lr = parentLabel.getBoundingClientRect();
-      if (lr.width >= 12 && lr.height >= 12) return parentLabel;
+      if (lr.width >= 12 && lr.height >= 12) return { el: parentLabel, rect: lr };
     }
 
-    // 부모 3단계까지 탐색 (토글 래퍼 찾기)
     let parent = input.parentElement;
     for (let i = 0; i < 3 && parent; i++) {
       const pr = parent.getBoundingClientRect();
       if (pr.width >= 12 && pr.height >= 12 && pr.width <= 200 && pr.height <= 100) {
-        return parent;
+        return { el: parent, rect: pr };
       }
       parent = parent.parentElement;
     }
     return null;
   }
 
-  // 2a. checkbox/radio — CSS 기반 교체 (스크린샷 방식보다 안정적)
-  function replaceNativeInput(input) {
-    const rect = input.getBoundingClientRect();
-    if (rect.width < 1 || rect.height < 1) return false;
+  // ════════════════════════════════════════════════════════════════
+  // Phase 1: DOM 수정 전에 모든 요소의 rect를 미리 수집
+  //          (수정 후 레이아웃이 달라지면 좌표가 어긋나는 버그 방지)
+  // ════════════════════════════════════════════════════════════════
+  const tasks = [];   // { el, rect, fallback }
+  const seen  = new WeakSet();
 
-    const size = Math.round(Math.max(rect.width, rect.height, 14));
-    const isRadio    = input.type === 'radio';
-    const isChecked  = input.checked;
-    const isIndet    = !isRadio && input.indeterminate;
-    const active     = isChecked || isIndet;
-
-    const box = document.createElement('div');
-
-    if (isRadio) {
-      box.style.cssText = [
-        `display:inline-flex`, `align-items:center`, `justify-content:center`,
-        `width:${size}px`, `height:${size}px`, `border-radius:50%`,
-        `border:2px solid ${isChecked ? '#3b82f6' : '#9ca3af'}`,
-        `background:white`, `box-sizing:border-box`, `flex-shrink:0`,
-      ].join(';');
-      if (isChecked) {
-        const dot = document.createElement('div');
-        const ds = Math.round(size * 0.42);
-        dot.style.cssText = `width:${ds}px;height:${ds}px;border-radius:50%;background:#3b82f6;`;
-        box.appendChild(dot);
-      }
-    } else {
-      box.style.cssText = [
-        `display:inline-flex`, `align-items:center`, `justify-content:center`,
-        `width:${size}px`, `height:${size}px`, `border-radius:4px`,
-        `border:2px solid ${active ? '#3b82f6' : '#9ca3af'}`,
-        `background:${active ? '#3b82f6' : 'white'}`,
-        `box-sizing:border-box`, `flex-shrink:0`,
-      ].join(';');
-      if (isChecked) {
-        const s = Math.round(size * 0.62);
-        box.innerHTML = `<svg width="${s}" height="${s}" viewBox="0 0 10 8" fill="none"><path d="M1 4L3.5 6.5L9 1" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
-      } else if (isIndet) {
-        box.innerHTML = `<svg width="${Math.round(size*0.55)}" height="2" viewBox="0 0 9 2" fill="none"><line x1="0.5" y1="1" x2="8.5" y2="1" stroke="white" stroke-width="2" stroke-linecap="round"/></svg>`;
-      }
-    }
-
-    const origDisplay = input.style.display;
-    input.parentNode.insertBefore(box, input);
-    input.style.display = 'none';
-    restoreFns.push(() => { box.remove(); input.style.display = origDisplay; });
-    return true;
+  // 1. <select>
+  for (const el of document.querySelectorAll('select')) {
+    if (el.closest('#figma-capture-ui') || seen.has(el)) continue;
+    seen.add(el);
+    tasks.push({ el, rect: el.getBoundingClientRect(), fallback: replaceSelectWithDiv });
   }
 
+  // 2a. checkbox / radio
   for (const input of document.querySelectorAll('input[type="checkbox"], input[type="radio"]')) {
-    if (input.closest('#figma-capture-ui')) continue;
-    if (processed.has(input)) continue;
-
+    if (input.closest('#figma-capture-ui') || seen.has(input)) continue;
     const rect = input.getBoundingClientRect();
     if (rect.width >= 1 && rect.height >= 1) {
-      // input 자체가 보이는 경우: 스크린샷 크롭 시도, 뷰포트 밖이면 CSS fallback
-      processed.add(input);
-      await replaceWithImg(input, replaceNativeInput);
+      seen.add(input);
+      tasks.push({ el: input, rect, fallback: null });  // 뷰포트 밖이면 crop null → 교체 안 됨 (native 유지)
     } else {
-      // hidden input: 시각적 래퍼 탐색 후 스크린샷
-      const target = findVisualTarget(input);
-      if (target && !processed.has(target)) {
-        processed.add(target);
-        await replaceWithImg(target, null);
+      const found = findVisualTarget(input);
+      if (found && !seen.has(found.el)) {
+        seen.add(found.el);
+        tasks.push({ el: found.el, rect: found.rect, fallback: null });
       }
     }
   }
 
-  // 2b. role="switch", 토글/스위치 클래스 — 크기 필터 후 항상 교체
-  //     (큰 컨테이너가 아닌 작은 UI 컴포넌트만 대상)
+  // 2b. role="switch", 토글/스위치 클래스
   for (const el of document.querySelectorAll(
     '[role="switch"], [class*="toggle"], [class*="Toggle"], [class*="switch"], [class*="Switch"], [data-state]'
   )) {
-    if (el.closest('#figma-capture-ui')) continue;
-    if (processed.has(el)) continue;
+    if (el.closest('#figma-capture-ui') || seen.has(el)) continue;
     const rect = el.getBoundingClientRect();
     if (rect.width < 1 || rect.height < 1 || rect.width > 200 || rect.height > 100) continue;
-    processed.add(el);
-    await replaceWithImg(el, null);
+    seen.add(el);
+    tasks.push({ el, rect, fallback: null });
   }
 
-  // 2c. label, slider, check — pseudo-element이 있는 경우만 교체
+  // 2c. label / slider — pseudo-element이 있는 경우만
   for (const el of document.querySelectorAll('label, [class*="slider"], [class*="Slider"]')) {
-    if (el.closest('#figma-capture-ui')) continue;
-    if (processed.has(el)) continue;
-
+    if (el.closest('#figma-capture-ui') || seen.has(el)) continue;
     const before = getComputedStyle(el, '::before');
     const after  = getComputedStyle(el, '::after');
-    const hasMeaningfulPseudo =
+    const hasPseudo =
       (before.content && before.content !== 'none' && before.content !== 'normal') ||
       (after.content  && after.content  !== 'none' && after.content  !== 'normal');
-    if (!hasMeaningfulPseudo) continue;
-
+    if (!hasPseudo) continue;
     const rect = el.getBoundingClientRect();
     if (rect.width < 1 || rect.height < 1 || rect.width > 300 || rect.height > 100) continue;
-    processed.add(el);
-    await replaceWithImg(el, null);
+    seen.add(el);
+    tasks.push({ el, rect, fallback: null });
   }
 
-  // ── 복원 함수 등록 ─────────────────────────────────────────────
+  // ════════════════════════════════════════════════════════════════
+  // Phase 2: 수집한 rect를 사용해 DOM 수정 (스크린샷 좌표와 항상 일치)
+  // ════════════════════════════════════════════════════════════════
+  for (const { el, rect, fallback } of tasks) {
+    await replaceWithCrop(el, rect, fallback ? () => fallback(el) : null);
+  }
+
+  // ── 복원 함수 등록 ───────────────────────────────────────────────
   window.__figmaRestorePreCapture = () => {
     restoreFns.forEach(fn => fn());
     restoreFns.length = 0;
@@ -251,13 +195,11 @@ async function precaptureInPage(screenshotDataUrl, scrollInfo) {
       window.scrollTo({ top: scrollInfo.sy, left: scrollInfo.sx, behavior: 'instant' });
     }
   };
-  // 안전장치: 60초 후 자동 복원 (수동 복원이 안 된 경우 대비)
   setTimeout(() => {
-    if (window.__figmaPreCaptureApplied) {
-      window.__figmaRestorePreCapture();
-    }
+    if (window.__figmaPreCaptureApplied) window.__figmaRestorePreCapture();
   }, 60000);
-  console.log('[Figma PreCapture] DOM prepared for capture');
+
+  console.log(`[Figma PreCapture] ${tasks.length}개 요소 처리 완료`);
 }
 
 // ── 헬퍼: 페이지 준비 (폰트 로드 + 스크롤 최상단) ───────────────
