@@ -13,6 +13,16 @@ async function precaptureInPage(screenshotDataUrl, scrollInfo) {
   const dpr = window.devicePixelRatio || 1;
 
   // 스크린샷에서 요소 영역을 잘라내서 data URL 반환
+  // 캔버스를 물리적 픽셀 크기로 만들어 Retina에서 선명하게 유지
+  let _screenshotSize = null;
+  async function getScreenshotSize(blob) {
+    if (_screenshotSize) return _screenshotSize;
+    const bmp = await createImageBitmap(blob);
+    _screenshotSize = { w: bmp.width, h: bmp.height };
+    bmp.close();
+    return _screenshotSize;
+  }
+
   async function cropToDataUrl(el) {
     if (!screenshotDataUrl) return null;
     try {
@@ -20,18 +30,23 @@ async function precaptureInPage(screenshotDataUrl, scrollInfo) {
       if (rect.width < 1 || rect.height < 1) return null;
 
       const blob = await fetch(screenshotDataUrl).then(r => r.blob());
-      const bitmap = await createImageBitmap(
-        blob,
-        Math.round(rect.left * dpr),
-        Math.round(rect.top * dpr),
-        Math.round(rect.width * dpr),
-        Math.round(rect.height * dpr)
-      );
+      const { w: ssW, h: ssH } = await getScreenshotSize(blob);
 
+      // 물리적 픽셀 좌표 계산 + viewport 경계 초과 방지
+      const sx = Math.max(0, Math.round(rect.left * dpr));
+      const sy = Math.max(0, Math.round(rect.top * dpr));
+      const sw = Math.min(Math.round(rect.width * dpr), ssW - sx);
+      const sh = Math.min(Math.round(rect.height * dpr), ssH - sy);
+      if (sw < 1 || sh < 1) return null;
+
+      const bitmap = await createImageBitmap(blob, sx, sy, sw, sh);
+
+      // 캔버스를 물리적 픽셀 크기로 → Retina에서 선명하게 렌더링
       const canvas = document.createElement('canvas');
-      canvas.width = Math.round(rect.width);
-      canvas.height = Math.round(rect.height);
-      canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      canvas.width = sw;
+      canvas.height = sh;
+      canvas.getContext('2d').drawImage(bitmap, 0, 0, sw, sh);
+      bitmap.close();
       return canvas.toDataURL();
     } catch {
       return null;
