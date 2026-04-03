@@ -141,13 +141,70 @@ async function precaptureInPage(screenshotDataUrl, scrollInfo) {
     return null;
   }
 
-  // 2a. checkbox/radio — 항상 교체 (시각적 래퍼 자동 탐색)
+  // 2a. checkbox/radio — CSS 기반 교체 (스크린샷 방식보다 안정적)
+  function replaceNativeInput(input) {
+    const rect = input.getBoundingClientRect();
+    if (rect.width < 1 || rect.height < 1) return false;
+
+    const size = Math.round(Math.max(rect.width, rect.height, 14));
+    const isRadio    = input.type === 'radio';
+    const isChecked  = input.checked;
+    const isIndet    = !isRadio && input.indeterminate;
+    const active     = isChecked || isIndet;
+
+    const box = document.createElement('div');
+
+    if (isRadio) {
+      box.style.cssText = [
+        `display:inline-flex`, `align-items:center`, `justify-content:center`,
+        `width:${size}px`, `height:${size}px`, `border-radius:50%`,
+        `border:2px solid ${isChecked ? '#3b82f6' : '#9ca3af'}`,
+        `background:white`, `box-sizing:border-box`, `flex-shrink:0`,
+      ].join(';');
+      if (isChecked) {
+        const dot = document.createElement('div');
+        const ds = Math.round(size * 0.42);
+        dot.style.cssText = `width:${ds}px;height:${ds}px;border-radius:50%;background:#3b82f6;`;
+        box.appendChild(dot);
+      }
+    } else {
+      box.style.cssText = [
+        `display:inline-flex`, `align-items:center`, `justify-content:center`,
+        `width:${size}px`, `height:${size}px`, `border-radius:4px`,
+        `border:2px solid ${active ? '#3b82f6' : '#9ca3af'}`,
+        `background:${active ? '#3b82f6' : 'white'}`,
+        `box-sizing:border-box`, `flex-shrink:0`,
+      ].join(';');
+      if (isChecked) {
+        const s = Math.round(size * 0.62);
+        box.innerHTML = `<svg width="${s}" height="${s}" viewBox="0 0 10 8" fill="none"><path d="M1 4L3.5 6.5L9 1" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+      } else if (isIndet) {
+        box.innerHTML = `<svg width="${Math.round(size*0.55)}" height="2" viewBox="0 0 9 2" fill="none"><line x1="0.5" y1="1" x2="8.5" y2="1" stroke="white" stroke-width="2" stroke-linecap="round"/></svg>`;
+      }
+    }
+
+    const origDisplay = input.style.display;
+    input.parentNode.insertBefore(box, input);
+    input.style.display = 'none';
+    restoreFns.push(() => { box.remove(); input.style.display = origDisplay; });
+    return true;
+  }
+
   for (const input of document.querySelectorAll('input[type="checkbox"], input[type="radio"]')) {
     if (input.closest('#figma-capture-ui')) continue;
-    const target = findVisualTarget(input);
-    if (!target || processed.has(target)) continue;
-    processed.add(target);
-    await replaceWithImg(target, null);
+    if (processed.has(input)) continue;
+
+    // 직접 교체 성공하면 processed에 추가
+    // 실패(hidden input)하면 시각적 래퍼 탐색
+    if (replaceNativeInput(input)) {
+      processed.add(input);
+    } else {
+      const target = findVisualTarget(input);
+      if (target && !processed.has(target)) {
+        processed.add(target);
+        await replaceWithImg(target, null);
+      }
+    }
   }
 
   // 2b. role="switch", 토글/스위치 클래스 — 크기 필터 후 항상 교체
