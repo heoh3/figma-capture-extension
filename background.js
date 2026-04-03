@@ -12,43 +12,45 @@ async function precaptureInPage(screenshotDataUrl, scrollInfo) {
   const restoreFns = [];
   const dpr = window.devicePixelRatio || 1;
 
-  // 스크린샷에서 요소 영역을 잘라내서 data URL 반환
-  // 캔버스를 물리적 픽셀 크기로 만들어 Retina에서 선명하게 유지
-  let _screenshotSize = null;
-  async function getScreenshotSize(blob) {
-    if (_screenshotSize) return _screenshotSize;
-    const bmp = await createImageBitmap(blob);
-    _screenshotSize = { w: bmp.width, h: bmp.height };
-    bmp.close();
-    return _screenshotSize;
+  // 스크린샷 이미지를 한 번만 로드해서 캐싱
+  let _screenshotImg = null;
+  function loadScreenshot() {
+    if (_screenshotImg) return Promise.resolve(_screenshotImg);
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => { _screenshotImg = img; resolve(img); };
+      img.onerror = reject;
+      img.src = screenshotDataUrl;
+    });
   }
 
+  // 요소 영역을 스크린샷에서 잘라내서 data URL 반환
+  // 물리적 픽셀(DPR) 기준으로 크롭 → Retina에서 선명하게 유지
   async function cropToDataUrl(el) {
     if (!screenshotDataUrl) return null;
     try {
       const rect = el.getBoundingClientRect();
       if (rect.width < 1 || rect.height < 1) return null;
 
-      const blob = await fetch(screenshotDataUrl).then(r => r.blob());
-      const { w: ssW, h: ssH } = await getScreenshotSize(blob);
+      const img = await loadScreenshot();
+      const ssW = img.naturalWidth;
+      const ssH = img.naturalHeight;
 
-      // 물리적 픽셀 좌표 계산 + viewport 경계 초과 방지
+      // 물리적 픽셀 좌표 계산 + 경계 초과 방지
       const sx = Math.max(0, Math.round(rect.left * dpr));
       const sy = Math.max(0, Math.round(rect.top * dpr));
       const sw = Math.min(Math.round(rect.width * dpr), ssW - sx);
       const sh = Math.min(Math.round(rect.height * dpr), ssH - sy);
       if (sw < 1 || sh < 1) return null;
 
-      const bitmap = await createImageBitmap(blob, sx, sy, sw, sh);
-
-      // 캔버스를 물리적 픽셀 크기로 → Retina에서 선명하게 렌더링
+      // 물리적 픽셀 크기 캔버스에 크롭 → Retina 선명도 유지
       const canvas = document.createElement('canvas');
       canvas.width = sw;
       canvas.height = sh;
-      canvas.getContext('2d').drawImage(bitmap, 0, 0, sw, sh);
-      bitmap.close();
+      canvas.getContext('2d').drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
       return canvas.toDataURL();
-    } catch {
+    } catch (e) {
+      console.warn('[Figma PreCapture] cropToDataUrl failed:', e);
       return null;
     }
   }
@@ -194,11 +196,13 @@ async function precaptureInPage(screenshotDataUrl, scrollInfo) {
     if (input.closest('#figma-capture-ui')) continue;
     if (processed.has(input)) continue;
 
-    // 직접 교체 성공하면 processed에 추가
-    // 실패(hidden input)하면 시각적 래퍼 탐색
-    if (replaceNativeInput(input)) {
+    const rect = input.getBoundingClientRect();
+    if (rect.width >= 1 && rect.height >= 1) {
+      // input 자체가 보이는 경우: 스크린샷 크롭 시도, 뷰포트 밖이면 CSS fallback
       processed.add(input);
+      await replaceWithImg(input, replaceNativeInput);
     } else {
+      // hidden input: 시각적 래퍼 탐색 후 스크린샷
       const target = findVisualTarget(input);
       if (target && !processed.has(target)) {
         processed.add(target);
